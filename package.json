@@ -1,0 +1,17 @@
+{
+  "name": "remote-terminal",
+  "version": "1.0.0",
+  "main": "d.js",
+  "scripts": {
+    "start": "node d.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "express-fileupload": "^1.5.2",
+    "pem": "^1.14.8",
+    "selfsigned": "^5.5.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "uuid": "^13.0.0"
+  }
+}
