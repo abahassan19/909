@@ -7,24 +7,29 @@ const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
+
+// ✅ EXPLICIT ping settings – match the client
 const io = new Server(server, {
   transports: ['websocket', 'polling'],
   cors: { origin: "*", methods: ["GET", "POST"] },
-  pingInterval: 25000,
-  pingTimeout: 60000,
-  maxHttpBufferSize: 100 * 1024 * 1024 // 100MB for file transfers
+  pingInterval: 25000,   // same as client
+  pingTimeout: 60000     // same as client
 });
 
 app.set('trust proxy', 1);
 
-const clients = new Map(); // uuid -> { socket, cwd, env, lastHeartbeat, connected }
-const viewers = new Map(); // uuid -> Set of sockets
+// Connected clients store: uuid -> { socket, cwd, env }
+const clients = new Map();
+// Viewers store: uuid -> Set of sockets
+const viewers = new Map();
+// Masters: Set of sockets
 const masters = new Set();
+
+// ✅ Heartbeat tracking: clientId -> lastHeartbeat timestamp
+const clientHeartbeats = new Map();
 
 const publicDir = path.join(__dirname, 'public-server');
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
-
-// [Keep the same HTML template as before, no changes needed]
 
 const indexHtml = `<!DOCTYPE html>
 <html>
@@ -491,6 +496,7 @@ const indexHtml = `<!DOCTYPE html>
 
 fs.writeFileSync(path.join(publicDir, 'index.html'), indexHtml);
 
+
 app.get('/master', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
@@ -499,106 +505,92 @@ app.get('/:uuid', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
 
-// Cleanup stale clients periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [uuid, data] of clients.entries()) {
-    if (!data.socket || !data.socket.connected) {
-      if (now - data.lastHeartbeat > 120000) { // 2 minutes without heartbeat
-        console.log(`[Server] Cleaning up stale client: ${uuid}`);
-        clients.delete(uuid);
-        viewers.delete(uuid);
-      }
-    }
-  }
-}, 60000);
-
 // Socket.io handling
 io.on('connection', (socket) => {
   let role = null;
   let clientId = null;
 
-  socket.on('register-client', (data) => {
-    role = 'client';
-    const oldId = data?.clientId;
-    const epoch = data?.epoch || Date.now();
+  // ✅ Listen for heartbeat from client
+  socket.on('heartbeat', () => {
+    if (clientId && clientHeartbeats.has(clientId)) {
+      clientHeartbeats.set(clientId, Date.now());
+    }
+  });
 
-    // Generate or reuse client ID
+  socket.on('register-client', (oldId) => {
+    role = 'client';
+    const connectionEpoch = Date.now();
+
     if (oldId && clients.has(oldId)) {
-      const existing = clients.get(oldId);
-      // Only reuse if the old client is actually disconnected
-      if (!existing.socket || !existing.socket.connected) {
-        clientId = oldId;
-      } else {
-        // If still connected, generate new ID to avoid conflicts
-        clientId = uuidv4();
-      }
+      clientId = oldId;
+      const existing = clients.get(clientId);
+      existing.socket = socket;
+      existing.epoch = connectionEpoch;
+      existing.cwd = existing.cwd || (process.platform === 'win32' ? process.env.USERPROFILE || process.cwd() : process.cwd());
+      console.log(`Client reconnected with existing UUID: ${clientId}`);
+      socket.emit('registered', clientId);
     } else {
-      clientId = oldId || uuidv4();
+      clientId = uuidv4();
+      clients.set(clientId, {
+        socket,
+        epoch: connectionEpoch,
+        cwd: process.platform === 'win32' ? process.env.USERPROFILE || process.cwd() : process.cwd(),
+        env: {}
+      });
+      console.log(`Client registered with new UUID: ${clientId}`);
+      socket.emit('registered', clientId);
     }
 
-    // Store client data
-    clients.set(clientId, {
-      socket,
-      epoch: epoch,
-      lastHeartbeat: Date.now(),
-      cwd: process.platform === 'win32' ? process.env.USERPROFILE || process.cwd() : process.cwd(),
-      env: {}
-    });
-
-    console.log(`[Server] Client registered: ${clientId}`);
-    socket.emit('registered', clientId);
+    // ✅ Initialize heartbeat timestamp
+    clientHeartbeats.set(clientId, Date.now());
 
     const clientData = clients.get(clientId);
     socket.emit('directory', clientData.cwd);
 
-    // Set up event handlers
-    socket.on('heartbeat', () => {
-      const data = clients.get(clientId);
-      if (data) {
-        data.lastHeartbeat = Date.now();
-      }
-    });
-
     socket.on('disconnect', () => {
-      console.log(`[Server] Client ${clientId} disconnected`);
-      
-      // Notify viewers and masters
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => {
-          s.emit('system', `[System] Client ${clientId} disconnected`);
-        });
-      }
-      masters.forEach(ms => {
-        ms.emit('system', `[System] Client ${clientId} disconnected`);
-      });
+      const current = clients.get(clientId);
+      if (!current || current.epoch !== connectionEpoch) return;
 
-      // Don't delete the client entry immediately, allow for reconnection
-      // The cleanup interval will handle stale entries
+      console.log(`Client ${clientId} disconnected`);
+      // ✅ Clean up heartbeat tracking
+      clientHeartbeats.delete(clientId);
+
+      const conns = viewers.get(clientId);
+      if (conns) {
+        conns.forEach(s => s.emit('system', '[System] Client disconnected'));
+      }
+      masters.forEach(ms => ms.emit('system', `[System] Client ${clientId} disconnected`));
+
+      // Cleanup stale entry after 60 seconds if not reconnected
+      setTimeout(() => {
+        const entry = clients.get(clientId);
+        if (entry && entry.epoch === connectionEpoch && (!entry.socket || !entry.socket.connected)) {
+          clients.delete(clientId);
+          console.log(`Cleaned up stale client entry: ${clientId}`);
+        }
+      }, 60000);
     });
 
-    // Forward events to viewers and masters
     socket.on('output', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('output', `[${clientId}] ${data}`));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('output', `[${clientId}] ${data}`));
       }
       masters.forEach(ms => ms.emit('output', `[${clientId}] ${data}`));
     });
 
     socket.on('error', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('error', `[${clientId}] ${data}`));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('error', `[${clientId}] ${data}`));
       }
       masters.forEach(ms => ms.emit('error', `[${clientId}] ${data}`));
     });
 
     socket.on('directory', (dir) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('directory', dir));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('directory', dir));
       }
       masters.forEach(ms => ms.emit('system', `[${clientId}] Directory changed to: ${dir}`));
     });
@@ -607,59 +599,59 @@ io.on('connection', (socket) => {
       socket.emit('command', cmd);
     });
 
-    // File transfer events
+    // ---- File transfer events from client ----
     socket.on('file-download-start', (meta) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('download-start', meta));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('download-start', meta));
       }
       masters.forEach(ms => ms.emit('download-start', meta));
     });
 
     socket.on('file-download-chunk', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('download-chunk', data));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('download-chunk', data));
       }
       masters.forEach(ms => ms.emit('download-chunk', data));
     });
 
     socket.on('file-download-end', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('download-end'));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('download-end'));
       }
       masters.forEach(ms => ms.emit('download-end'));
     });
 
     socket.on('file-download-error', (msg) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('download-error', msg));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('download-error', msg));
       }
       masters.forEach(ms => ms.emit('download-error', msg));
     });
 
     socket.on('file-uploaded', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('upload-complete', data));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('upload-complete', data));
       }
       masters.forEach(ms => ms.emit('upload-complete', data));
     });
 
     socket.on('file-upload-error', (msg) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('upload-error', msg));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('upload-error', msg));
       }
       masters.forEach(ms => ms.emit('upload-error', msg));
     });
 
     socket.on('upload-progress', (data) => {
-      const viewersSet = viewers.get(clientId);
-      if (viewersSet) {
-        viewersSet.forEach(s => s.emit('upload-progress', data));
+      const set = viewers.get(clientId);
+      if (set) {
+        set.forEach(s => s.emit('upload-progress', data));
       }
       masters.forEach(ms => ms.emit('upload-progress', data));
     });
@@ -668,7 +660,6 @@ io.on('connection', (socket) => {
   socket.on('register-viewer', (id) => {
     role = 'viewer';
     clientId = id;
-    
     if (!clients.has(clientId)) {
       socket.emit('system', '[System] Error: Client not connected or invalid UUID');
       return;
@@ -684,12 +675,8 @@ io.on('connection', (socket) => {
     socket.emit('directory', clientData.cwd);
 
     socket.on('command', (cmd) => {
-      if (clientData.socket && clientData.socket.connected) {
-        clientData.socket.emit('run-command', cmd);
-        socket.emit('command', cmd);
-      } else {
-        socket.emit('system', `[System] Client ${clientId} is not connected`);
-      }
+      clientData.socket.emit('run-command', cmd);
+      socket.emit('command', cmd);
     });
 
     socket.on('disconnect', () => {
@@ -702,32 +689,22 @@ io.on('connection', (socket) => {
       }
     });
 
-    // Upload events from viewer
+    // ---- Upload events from viewer ----
     socket.on('upload-start', (meta) => {
-      if (clientData.socket && clientData.socket.connected) {
-        clientData.socket.emit('file-upload-start', meta);
-      }
+      clientData.socket.emit('file-upload-start', meta);
     });
 
     socket.on('upload-chunk', (data) => {
-      if (clientData.socket && clientData.socket.connected) {
-        clientData.socket.emit('file-upload-chunk', data);
-      }
+      clientData.socket.emit('file-upload-chunk', data);
     });
 
     socket.on('upload-end', (data) => {
-      if (clientData.socket && clientData.socket.connected) {
-        clientData.socket.emit('file-upload-end', data);
-      }
+      clientData.socket.emit('file-upload-end', data);
     });
 
-    // Download events from viewer
+    // ---- Download events from viewer ----
     socket.on('download-request', (data) => {
-      if (clientData.socket && clientData.socket.connected) {
-        clientData.socket.emit('file-download-request', { path: data.path });
-      } else {
-        socket.emit('download-error', 'Client is not connected');
-      }
+      clientData.socket.emit('file-download-request', { path: data.path });
     });
   });
 
@@ -735,30 +712,26 @@ io.on('connection', (socket) => {
     role = 'master';
     masters.add(socket);
     socket.emit('system', `[System] Registered as master terminal`);
-    console.log('[Server] Master terminal connected');
+    console.log('Master terminal connected');
 
     socket.on('command', (cmd) => {
       clients.forEach(({ socket: clientSocket }) => {
-        if (clientSocket && clientSocket.connected) {
-          clientSocket.emit('run-command', cmd);
-        }
+        clientSocket.emit('run-command', cmd);
       });
       socket.emit('command', cmd);
     });
 
     socket.on('disconnect', () => {
       masters.delete(socket);
-      console.log('[Server] Master terminal disconnected');
+      console.log('Master terminal disconnected');
     });
 
-    // Upload events from master (with include/exclude support)
+    // ---- Upload events from master (with include/exclude support) ----
     socket.on('upload-start', (meta) => {
       if (meta.targets === null) {
         // Broadcast to ALL clients
         clients.forEach((client, id) => {
-          if (client.socket && client.socket.connected) {
-            client.socket.emit('file-upload-start', meta);
-          }
+          client.socket.emit('file-upload-start', meta);
         });
       } else {
         // Only targeted clients
@@ -774,9 +747,7 @@ io.on('connection', (socket) => {
     socket.on('upload-chunk', (data) => {
       if (data.targets === null) {
         clients.forEach((client, id) => {
-          if (client.socket && client.socket.connected) {
-            client.socket.emit('file-upload-chunk', data);
-          }
+          client.socket.emit('file-upload-chunk', data);
         });
       } else {
         data.targets.forEach(id => {
@@ -791,9 +762,7 @@ io.on('connection', (socket) => {
     socket.on('upload-end', (data) => {
       if (data.targets === null) {
         clients.forEach((client, id) => {
-          if (client.socket && client.socket.connected) {
-            client.socket.emit('file-upload-end', data);
-          }
+          client.socket.emit('file-upload-end', data);
         });
       } else {
         data.targets.forEach(id => {
@@ -805,7 +774,7 @@ io.on('connection', (socket) => {
       }
     });
 
-    // Download events from master
+    // ---- Download events from master (with include/exclude support) ----
     socket.on('download-request', (data) => {
       if (data.targets === null || data.targets.length === 0) {
         // Pick first available client
@@ -851,8 +820,25 @@ io.on('connection', (socket) => {
   });
 });
 
+// ✅ Periodic heartbeat health check – force‑reconnect stale clients
+setInterval(() => {
+  const now = Date.now();
+  const STALE_THRESHOLD = 90000; // 90 seconds
+
+  for (const [clientId, lastHeartbeat] of clientHeartbeats) {
+    if (now - lastHeartbeat > STALE_THRESHOLD) {
+      const client = clients.get(clientId);
+      if (client && client.socket && client.socket.connected) {
+        console.log(`[Health] Client ${clientId} stale (no heartbeat for ${Math.round((now - lastHeartbeat)/1000)}s) – forcing disconnect`);
+        client.socket.disconnect(true); // force close, client will reconnect
+      }
+      // Remove from heartbeat map (will be cleaned up on actual disconnect)
+      clientHeartbeats.delete(clientId);
+    }
+  }
+}, 30000); // check every 30 seconds
+
 const PORT = 8080;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] Listening on http://localhost:${PORT}`);
-  console.log(`[Server] Clients can connect to ws://localhost:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
 });
